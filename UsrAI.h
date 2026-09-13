@@ -3,11 +3,12 @@
 
 #include "ai.h"
 #include <unordered_map>
+#include <set>
 
 extern tagGame tagUsrGame;
 extern ins UsrIns;
 /*##########DO NOT MODIFY THE CODE ABOVE##########*/
-#include <set>
+
 class UsrAI:public AI
 {
 public:
@@ -31,51 +32,51 @@ private:
         tagUsrGame.clearInsRet();
     }
     /*##########DO NOT MODIFY THE CODE IN THE CLASS##########*/
-
-
-
 };
-// 第一阶段用到的状态变量
-extern int m_gameStage;//游戏阶段标记：0=开局发育第一阶段；1=防守第一波；2=防守二三波；3=进攻阶段；
-//建筑建造标记，防止每帧重复调用HumanBuild
-extern bool m_built_storage;//是否建好仓库
-extern bool m_built_granary;//是否建好谷仓
-extern bool m_built_barrack;//是否建好兵营
-extern bool m_built_market;//是否建好市场
-extern bool m_built_range;//是否建好靶场
 
-extern bool m_research_arrowtower;//谷仓是否研发箭塔科技
-extern int m_target_farmer_count;//目标村民数量，第一阶段目标24个
+// ================== 辅助函数声明 ==================
+bool findFlatBlock(int &outDR, int &outUR, const tagInfo& info);// 寻找平地（从市镇中心附近，带偏移）
+int findNearestResource(const tagInfo& info, int resType, int farmerSN);// 找最近某类资源SN
+int getPriestSN(const tagInfo& info);// 从 armies 中找祭司SN（祭司不在farmers里！）
 
-// 辅助函数声明
-bool findFlatBlock(int &outDR, int &outUR, const tagInfo& info);// 辅助：寻找平地建造建筑函数，返回true找到，输出块坐标x,y
-int findNearestResource(const tagInfo& info, int resType, int farmerSN);// 根据距离找最近的某一类资源SN
-//========任务状态全局变量========
-extern int m_gameStage;
+// ================== 全局状态变量声明 ==================
+extern int m_gameStage;//游戏阶段标记
 
-//开局8个村民分工标记 -1=未分配
-extern int worker_fruit[4];     //4个采果子村民SN
-extern int worker_wood[3];      //3个砍树村民SN
-extern int worker_builder;      //专职造房子的村民SN
+// 开局分工：6个采果（开局4人+新村民2人）、3个伐木、1个专职builder
+extern int worker_fruit[6];
+extern int worker_wood[3];
+extern int worker_builder;
 
-//新出生村民计数器
-extern int new_farmer_idx;      //新产出村民计数 0,1,2,3,4,5,6...
+// 新出生村民计数器
+extern int new_farmer_idx;
 
-//双人打猎
-extern int hunter_wait_sn;      //第一个猎人等待的村民SN
-extern int hunter_partner_sn;   //第二个猎人伙伴SN
-extern bool hunter_waiting;     //是否正在等待第二个猎人
-
-//打猎完成之后建造任务
+// 双人打猎
+extern int hunter_wait_sn;
+extern int hunter_partner_sn;
+extern bool hunter_waiting;
 extern bool build_storage_after_hunt;
-extern bool build_market_after_hunt;
 
-//祭司
+// 祭司
 extern int priestSN;
 extern double priest_safeDR;
 extern double priest_safeUR;
+extern bool m_priest_moving;
+extern int priest_explore_idx;
+extern int priest_last_move_frame;// 上一次给祭司发移动指令的帧，用于节流
 
-//记录已经分配过的村民SN，防止重复分配
+// 已分配村民SN + 岗位集合
 extern std::set<int> assigned_farmer_sn;
+extern std::set<int> gazelle_worker_sn;// 采集羚羊的村民
+extern std::set<int> gold_worker_sn;   // 采金村民
+extern std::set<int> stone_worker_sn;  // 采石村民
+
+// 科技研发标记
+extern bool m_research_arrowtower;// 谷仓：研发建造箭塔
+extern bool m_research_wood;       // 市场：伐木科技
+extern bool m_research_gold;       // 市场：金矿科技
+extern bool m_research_composite;  // 靶场：复合弓科技
+
+// 建筑位置尝试偏移（每个建筑类型独立，防止死磕同一个失败位置）
+extern int g_buildTry[BUILDING_TYPE_MAXNUM];
 
 #endif
