@@ -3,7 +3,7 @@
 
 #include "ai.h"
 #include <unordered_map>
-#include <unordered_set>
+#include <set>
 
 extern tagGame tagUsrGame;
 extern ins UsrIns;
@@ -17,16 +17,16 @@ public:
 
 private:
     void processData() override;
-    tagInfo getInfo(){return tagUsrGame.getInfo();}
     int AddToIns(instruction ins) override
-    {
-        UsrIns.lock.lock();
-        ins.id=UsrIns.g_id;
-        UsrIns.g_id++;
-        UsrIns.instructions.push(ins);
-        UsrIns.lock.unlock();
-        return ins.id;
-    }
+        {
+            UsrIns.lock.lock();
+            ins.id=UsrIns.g_id;
+            UsrIns.g_id++;
+            UsrIns.instructions.push(ins);
+            UsrIns.lock.unlock();
+            return ins.id;
+        }
+    tagInfo getInfo(){return tagUsrGame.getInfo();}
     void clearInsRet() override
     {
         tagUsrGame.clearInsRet();
@@ -34,84 +34,131 @@ private:
     /*##########DO NOT MODIFY THE CODE IN THE CLASS##########*/
 };
 
-/*##########YOUR CODE BEGINS HERE##########*/
+/* =====================================================================
+ * 以下是 AI 用到的全局状态与辅助函数声明
+ * （本工程的 AI 状态按文件级全局变量保存，跨帧持久化）
+ * ===================================================================== */
 
-#include <vector>
+// ---------- 策略参数（帧数、资源成本和目标数量） ----------
+constexpr int FPS = 25;
+constexpr int SEC(int seconds) { return seconds * FPS; }
 
-// 村民工作类型枚举：记录每个村民被 AI 指派的职责。
-// 按开局经济建议分配：4 人浆果、2 人木头、1 人石头、1 人建设者预留。
-enum FarmerJob
-{
-    FARMER_JOB_UNASSIGNED = 0, // 未分配：尚未被 AI 指派任何工作
-    FARMER_JOB_BERRY,          // 采集浆果（食物）
-    FARMER_JOB_WOOD,           // 采集木材
-    FARMER_JOB_STONE,          // 采集石头
-    FARMER_JOB_BUILDER         // 建设者预留：不派采集任务，等待后续建房轮次
+constexpr int FRAME_PRIEST_RETURN = SEC(200);
+constexpr int FRAME_WATCH = SEC(220);
+constexpr int FRAME_HARD_DEFENSE = SEC(280);
+
+constexpr double PRIEST_BEHIND_TOWER_BLOCKS = 4.0;
+constexpr double TOWER_ATTACK_RANGE_BLOCKS = 7.0;
+constexpr double DEFENSE_TRIGGER_BLOCKS = 20.0;
+constexpr double DEFENSE_SAFE_CORE_BLOCKS = 22.0;
+constexpr double DEFENSE_SAFE_FARMER_BLOCKS = 10.0;
+constexpr int DEFENSE_SAFE_FRAMES = 600;
+
+constexpr int COST_FARMER_FOOD = 50;
+constexpr int COST_BRONZE_FOOD = 800;
+constexpr int COST_HOUSE_WOOD = 30;
+constexpr int COST_STOCK_WOOD = 120;
+constexpr int COST_CAMP_WOOD = 125;
+constexpr int COST_MARKET_WOOD = 150;
+constexpr int COST_RANGE_WOOD = 150;
+constexpr int COST_FARM_WOOD = 75;
+constexpr int COST_TOWERTECH_FOOD = 50;
+constexpr int COST_COMPOSITE_FOOD = 40;
+constexpr int COST_COMPOSITE_GOLD = 20;
+constexpr int COST_TECH_WOOD_F = 120;
+constexpr int COST_TECH_WOOD_W = 75;
+constexpr int COST_TECH_COMP_F = 180;
+constexpr int COST_TECH_COMP_W = 100;
+
+constexpr int TARGET_POST_WAVE2_FOOD_WORKERS = 9;
+constexpr int TARGET_POST_WAVE2_FARMS = 9;
+constexpr int POST_WAVE2_FARM_WOOD_RESERVE = 350;
+constexpr int TARGET_GOLD_MINER = 2;
+constexpr int TARGET_LAND_FARMERS = 20;
+constexpr int PRE_BRONZE_LAND_FARMERS = 14;
+constexpr int PRE_WAVE2_LAND_FARMERS = 16;
+constexpr int TARGET_UPGRADE_FOOD_WORKERS = 11;
+constexpr int MAX_HOUSES = 12;
+constexpr double HUNT_SEARCH_RADIUS = 20.0;
+constexpr double HUNT_CHASE_LIMIT = 25.0;
+constexpr double HUNTER_MEET_DISTANCE = 2.0;
+
+constexpr int KEY_STOCK_GOLD = 9002;
+
+// ---------- 村民岗位枚举（role map 的取值） ----------
+enum UsrRole {
+    ROLE_NONE   = 0,  // 未分配
+    ROLE_BUILDER= 1,  // 专职建筑工（全程只负责建造链）
+    ROLE_WOOD   = 2,  // 伐木
+    ROLE_BUSH   = 3,  // 采浆果
+    ROLE_HUNTER = 4,  // 双人猎瞪羚
+    ROLE_FARM   = 5,  // 种田
+    ROLE_GOLD   = 6,  // 采金（铜器后）
+    ROLE_STONE  = 7   // 采石（备用）
 };
 
-// 保存 AI 在不同游戏帧之间需要记住的信息。
-// 这里目前只记录第一轮需要的关键对象和基地朝向，不包含任何行动策略。
-struct AiRuntimeState
-{
-    int lastFrame = -1;              // 上一次处理的游戏帧，用于判断是否开始了新对局
-    int lastReportFrame = -1;        // 上一次输出状态信息时的游戏帧
-    bool initialized = false;        // 市镇中心、仓库、谷仓和祭司是否已经全部找到
-    bool initializationReported = false; // 是否已经输出过本局的初始化信息
+// ---------- 辅助函数（定义在 UsrAI.cpp） ----------
+const tagFarmer*   usrGetFarmer(const tagInfo& info, int sn);
+const tagArmy*     usrGetArmy(const tagInfo& info, int sn);
+bool   usrHasBuilding(const tagInfo& info, int type);                 // 含在建(Percent>0)
+int    usrCountBuilt(const tagInfo& info, int type);                  // 仅已建成(Percent>=100)
+bool   usrFindFlatNear(int &outDR, int &outUR, const tagInfo& info,
+                       int cDR, int cUR, int minR, int maxR);          // 以某块为中心环形找3x3平地
+int    usrNearestResource(const tagInfo& info, int resType,
+                          double fromDR, double fromUR, bool liveOnly);
+int    usrBestGatherResource(const tagInfo& info, int resType,
+                             const tagFarmer& farmer);
+int    usrCountLandFarmers(const tagInfo& info);
+int    usrNearestBuilding(const tagInfo& info, int type,
+                          double fromDR, double fromUR);
+double usrBlockDist(int aDR, int aUR, int bDR, int bUR);
 
-    int centerSn = -1;               // 市镇中心的唯一编号 SN
-    int priestSn = -1;               // 祭司的唯一编号 SN
-    int stockSn = -1;                // 仓库的唯一编号 SN
-    int granarySn = -1;              // 谷仓的唯一编号 SN
-    std::vector<int> arrowTowerSns;   // 我方所有已有箭塔的 SN
+// ---------- 全局状态变量（定义在 UsrAI.cpp） ----------
+extern int  g_aiframe;                         // 缓存当前帧号
 
-    int baseDR = -1;                 // 基地（市镇中心）的 DR 区块坐标
-    int baseUR = -1;                 // 基地（市镇中心）的 UR 区块坐标
-    int towardCenterDR = 0;          // DR 方向上朝地图中心移动的符号：-1、0 或 1
-    int towardCenterUR = 0;          // UR 方向上朝地图中心移动的符号：-1、0 或 1
+// 开局分工
+extern std::unordered_map<int,int> g_role;   // 村民SN -> 岗位(UsrRole)
+extern int  g_builderSN;                     // 专职建筑工SN
+extern int  g_hunterSN[2];                   // 双人猎两个村民SN
+extern bool g_hunterActive;                  // 双人猎是否启用
+extern bool g_initDone;                      // 开局8人初始分配是否完成
 
-    bool initialFarmersCaptured = false; // 是否已经记录本局开局时存在的村民
-    std::vector<int> initialFarmerSns;   // 开局村民的 SN，后续新生产的村民不属于本轮范围
-    std::vector<int> nearbyBushSns;      // 基地附近仍可采集的浆果丛
-    std::vector<int> nearbyTreeSns;      // 基地附近仍可采集的树木
-    std::vector<int> nearbyStoneSns;     // 基地附近仍可采集的石矿
-    std::vector<int> nearbyGoldSns;     // 基地附近仍可采集的金矿
-    std::unordered_map<int, int> farmerGatherTargets; // 村民 SN -> 已分配资源 SN
-    std::unordered_map<int, int> pendingGatherOrders; // 采集指令 ID -> 村民 SN
-    std::unordered_map<int, int> farmerJobs;         // 村民 SN -> FarmerJob 工作类型
-    std::unordered_map<int, int> farmerOrderFrame;   // 村民 SN -> 最近一次下令的帧号，用于下令后冷却
+// 防守阵地（箭塔/TC）
+extern int  g_defTowerSN;                    // 主防守箭塔SN（-1=暂无，用TC）
+extern int  g_defTowerDR, g_defTowerUR;      // 主防守箭塔块坐标
+extern int  g_tcDR, g_tcUR;                  // TC块坐标
+extern bool g_towerTechIssued;               // 箭塔科技已下单
+extern bool g_towerTechBusy;                 // 见过科技研发中
+extern bool g_towerTechDone;                 // 箭塔科技已完成
 
-    // 市镇中心持续生产村民相关状态
-    int pendingCenterProductionOrder = -1; // 正在等待 ins_ret 结果的造村民指令 ID，-1 表示无待确认指令
-    int lastCenterProductionFrame = -1;    // 上次发起造村民指令的帧号，失败后用于间隔重试
+// 防守状态机
+extern bool g_defenseMode;                   // 当前波次防守模式（箭塔主防，受攻击村民单独撤离）
+extern int  g_calmFrames;                    // 持续无有效威胁的帧数
+extern bool g_wave1Handled;                  // 第一波已撑过（用于日志/状态切换）
+extern bool g_wave2Handled;                  // 第二波已撑过（村民阶段目标提升到20）
+extern int  g_activeDefenseWave;             // 当前防守波次，进入防守时锁定
 
-    // 建设者与建房相关状态
-    int builderSn = -1;                        // 当前固定建设者 SN，-1 表示尚未指定
-    int pendingBuildOrder = -1;               // 待确认的建房指令 ID，-1 表示无
-    int buildSiteSn = -1;                      // 正在建造中的房屋建筑 SN，-1 表示无在建房屋
-    int lastBuildFrame = -1;                   // 上次发起建房指令的帧号
-    int lastBuildBlockDR = -1;                // 上次建房指令的块坐标 DR（失败时加入黑名单）
-    int lastBuildBlockUR = -1;                // 上次建房指令的块坐标 UR
-    std::unordered_set<int> failedBuildPositions; // 近期失败的候选位置（编码为 BlockDR*1000+BlockUR），避免重复试同一位置
-    bool builderNeedsWood = false;             // 房屋建成后，固定建设者是否需要被派去临时伐木
+// 祭司
+extern int  g_priestSN;
+extern int  g_priestScoutIdx;                // 8方向探路下标
+extern int  g_priestLastMoveFrame;           // 移动指令节流（400帧）
+extern int  g_priestConvertTarget;           // 当前正在转换的目标SN
+extern double g_priestPointDR, g_priestPointUR; // 塔后4格安全点（细节坐标）
+extern double g_rallyDR, g_rallyUR;          // 防守阵地参考点（细节坐标）
 
-    // 祭司分阶段探路状态机
-    int priestState = 0;                // 0=探索出发 1=返程 2=箭塔旁防守等第一波 3=第一波后再探索
-    int pendingPriestOrder = -1;       // 待确认的祭司移动指令 ID
-    int priestExploreStep = 0;         // 已向中心推进的段数（每段 5 格）
-    int priestMaxBlood = -1;            // 记录祭司最大血量，用于检测掉血
-    bool waveSeen = false;              // 是否已经看到过第一波敌军
-    int noEnemyFrames = 0;              // 基地附近连续无敌军的帧数
-    int lastPriestMoveFrame = -1;       // 上次给祭司下移动指令的帧
-    std::unordered_set<int> visitedSites; // 已访问过的侦察点（编码为 blockDR*100+blockUR）
-    double lastDistanceToTarget = -1.0; // 上次检查时祭司与目标的距离（用于卡住检测）
-    int lastDistanceCheckFrame = -1;    // 上次距离检查帧
-    int lateralSide = 0;                // 横向探索方向：-1=左，1=右，0=未开始
-    bool atMaxRange = false;            // 是否已到达25格最大半径
-    bool productionStoppedLogged = false; // 已输出过停止生产日志
-};
+// 建造去重/节流
+extern std::unordered_map<int,int> g_lastBuildTry;   // 建筑类型 -> 上次尝试帧
+extern bool g_goldStockBuilt;                        // 金矿旁仓库已建
 
-// 全局状态对象定义在 UsrAI.cpp 中，供后续各轮策略继续使用。
-extern AiRuntimeState gAiState;
+// 科技去重
+extern bool g_woodTechIssued;
+extern bool g_woodTechBusy;
+extern bool g_woodTechDone;
+extern bool g_compositeIssued;
+extern bool g_compositeTechBusy;
+extern bool g_compositeTechDone;
 
-/*##########YOUR CODE ENDS HERE##########*/
+// 每帧"同一SN只下一条命令"去重
+extern std::set<int> g_orderedThisFrame;
+
 #endif // USRAI_H
