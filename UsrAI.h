@@ -48,11 +48,23 @@ constexpr int FRAME_WATCH = SEC(220);
 constexpr int FRAME_HARD_DEFENSE = SEC(280);
 
 constexpr double PRIEST_BEHIND_TOWER_BLOCKS = 4.0;
+constexpr double PRIEST_EMERGENCY_BEHIND_TOWER_BLOCKS = 2.0;
 constexpr double TOWER_ATTACK_RANGE_BLOCKS = 7.0;
+constexpr int TOWER_RESCUE_STABLE_FRAMES = 25;
 constexpr double DEFENSE_TRIGGER_BLOCKS = 20.0;
 constexpr double DEFENSE_SAFE_CORE_BLOCKS = 22.0;
 constexpr double DEFENSE_SAFE_FARMER_BLOCKS = 10.0;
 constexpr int DEFENSE_SAFE_FRAMES = 600;
+constexpr int DEFENSE_CLEANUP_MAX_UNITS = 2;
+
+constexpr int SIEGE_INTERCEPT_MAX_UNITS = 2;
+constexpr double SIEGE_INTERCEPT_RADIUS_BLOCKS = 14.0;
+constexpr int SIEGE_INTERCEPT_MIN_HEALTH_PERCENT = 35;
+
+constexpr int FRAME_RANGED_SCOUT_RECALL = SEC(780);
+constexpr double RANGED_SCOUT_RADIUS_BLOCKS = 25.0;
+constexpr double RANGED_SCOUT_ENEMY_RANGE_BLOCKS = 15.0;
+constexpr int RANGED_SCOUT_RETURN_HEALTH_PERCENT = 70;
 
 constexpr int COST_FARMER_FOOD = 50;
 constexpr int COST_BRONZE_FOOD = 800;
@@ -70,8 +82,8 @@ constexpr int COST_TECH_WOOD_W = 75;
 constexpr int COST_TECH_COMP_F = 180;
 constexpr int COST_TECH_COMP_W = 100;
 
-constexpr int TARGET_POST_WAVE2_FOOD_WORKERS = 9;
-constexpr int TARGET_POST_WAVE2_FARMS = 9;
+constexpr int TARGET_BERRY_FARM_WORKERS = 6;
+constexpr int MIN_LAND_FARMERS_FOR_HUNTER_PAIR = 12;
 constexpr int POST_WAVE2_FARM_WOOD_RESERVE = 350;
 constexpr int TARGET_GOLD_MINER = 2;
 constexpr int TARGET_LAND_FARMERS = 20;
