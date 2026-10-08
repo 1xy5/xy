@@ -35,6 +35,7 @@ bool g_defenseMode = false;
 int  g_calmFrames = 0;
 bool g_wave1Handled = false;
 bool g_wave2Handled = false;
+bool g_wave3Handled = false;
 int  g_activeDefenseWave = 0;
 
 int  g_priestSN = -1;
@@ -59,7 +60,14 @@ set<int> g_orderedThisFrame;
 struct PendingBuild { int builder, type, dr, ur, frame; };
 static unordered_map<int, PendingBuild> g_pendingBuild; // order id -> build
 static unordered_map<int, PendingBuild> g_acceptedBuild; // builder SN -> build
+// 加分任务只跟踪一座仓库的位置；完工才累计，不包含原有经济仓库。
+struct ScoreStockTask {
+    int completed = 0, dr = -1, ur = -1, retryAfter = 0;
+    bool started = false;
+};
+static ScoreStockTask g_scoreStock;
 static set<int> g_failedBuildSites;
+static map<int,int> g_towerSiteRetryAfter; // 塔位临时重叠：短暂跳过，单位离开后允许重试。
 static unordered_map<int,int> g_farmerGatherTargets;
 static unordered_map<int,int> g_gatherOrders;
 static unordered_map<int,int> g_gatherOrderFrames;
@@ -102,6 +110,12 @@ static double g_priestRetreatDR = 0.0;
 static double g_priestRetreatUR = 0.0;
 static set<int> g_siegeInterceptors;
 static int g_siegeInterceptTarget = -1;
+static int g_siegeMissingSince = -1; // 原拦截目标连续不可见的起始帧。
+static int g_siegeHandoffSince = -1; // 原目标死亡后，等待下一辆的起始帧。
+static int g_siegeHandoffPrevious = -1; // 仅用于交接日志，不再作为攻击目标。
+static int g_backupTowerSN = -1;
+static bool g_secondTowerBuilt = false; // 完成过就不重复补造，最多新增一座。
+static set<int> g_towerStoneWorkers;     // 第二波后临时从普通伐木工中调出。
 
 enum RangedScoutState { RANGED_SCOUT_NONE, RANGED_SCOUT_EXPLORE,
                         RANGED_SCOUT_RETURN, RANGED_SCOUT_HOLD,
@@ -110,6 +124,7 @@ static int g_rangedScoutSN = -1;
 static RangedScoutState g_rangedScoutState = RANGED_SCOUT_NONE;
 static int g_rangedScoutPoint = 0;
 static int g_rangedScoutLastMoveFrame = -1000;
+static bool g_postWave3ScoutStarted = false; // 本轮仅恢复第三波后一次出发。
 
 // 防守逻辑在文件后部定义；双人猎需要用它避免覆盖被锁定村民的撤退命令。
 static int enemyTargetingFarmer(const tagInfo& info, int farmerSN);
@@ -176,6 +191,83 @@ int usrCountBuilt(const tagInfo& info, int type)
     return n;
 }
 
+// 普通经济建筑的通道和间距保持不变。
+static bool buildSiteClear(const tagInfo& info, int dr, int ur)
+{
+    if(!info.theMap || info.theMap->empty()) return false;
+    int rows = (int)info.theMap->size(), cols = (int)(*info.theMap)[0].size();
+    if(dr < 2 || ur < 2 || dr >= rows-2 || ur >= cols-2 ||
+       g_failedBuildSites.count(dr*1000+ur)) return false;
+    int height = (*info.theMap)[dr][ur].height;
+    for(int i=-1; i<=1; ++i) for(int j=-1; j<=1; ++j)
+        if((*info.theMap)[dr+i][ur+j].type != MAPPATTERN_GRASS ||
+           (*info.theMap)[dr+i][ur+j].height != height) return false;
+    if(g_tcDR >= 0 && g_tcUR >= 0 && usrBlockDist(dr, ur, g_tcDR, g_tcUR) <= 14.0 &&
+       (abs(dr-g_tcDR) <= 2 || abs(ur-g_tcUR) <= 2)) return false;
+    for(const auto& b : info.buildings)
+        if(abs(b.BlockDR-dr) <= 3 && abs(b.BlockUR-ur) <= 3) return false;
+    for(const auto& r : info.resources)
+        if((r.Type == RESOURCE_TREE || r.Type == RESOURCE_BUSH ||
+            r.Type == RESOURCE_STONE || r.Type == RESOURCE_GOLD) &&
+           r.BlockDR >= 0 && r.BlockUR >= 0 &&
+           abs(r.BlockDR-dr) <= 1 && abs(r.BlockUR-ur) <= 1) return false;
+    return true;
+}
+
+// 箭塔实际占地2x2；建筑间留一格通道，不沿用普通建筑的锚点间距。
+static bool secondTowerSiteClear(const tagInfo& info, int dr, int ur,
+                                 const char** rejected = nullptr)
+{
+    // 仅记录原检查遇到的首个失败原因，不改变合法性判断。
+    auto reject = [=](const char* reason) {
+        if(rejected) *rejected = reason;
+        return false;
+    };
+    if(rejected) *rejected = nullptr;
+    if(!info.theMap || info.theMap->empty()) return reject("map_missing");
+    const int size = SIZELEN_SMALL;
+    const int key = dr*1000+ur;
+    if(dr < 0 || ur < 0 || dr+size > (int)info.theMap->size() ||
+       ur+size > (int)(*info.theMap)[0].size()) return reject("map_bounds");
+    if(g_failedBuildSites.count(key)) return reject("failed_site");
+    auto retry = g_towerSiteRetryAfter.find(key);
+    if(retry != g_towerSiteRetryAfter.end() && g_aiframe < retry->second) return reject("retry_cooldown");
+    int height = (*info.theMap)[dr][ur].height;
+    if(height < 0) return reject("height_unknown");
+    for(int x=dr; x<dr+size; ++x) for(int y=ur; y<ur+size; ++y)
+    {
+        const auto& cell = (*info.theMap)[x][y];
+        if(cell.height != height) return reject("uneven_ground");
+        if(cell.type != MAPPATTERN_GRASS && cell.type != MAPPATTERN_DESERT)
+            return reject("terrain_type");
+    }
+    if(g_tcDR >= 0 && g_tcUR >= 0 && usrBlockDist(dr,ur,g_tcDR,g_tcUR) <= 14.0 &&
+       (abs(dr-g_tcDR) <= 2 || abs(ur-g_tcUR) <= 2)) return reject("tc_corridor");
+    auto overlaps = [=](int x, int y, int width, int gap) {
+        return dr < x+width+gap && dr+size+gap > x &&
+               ur < y+width+gap && ur+size+gap > y;
+    };
+    auto blocksBuilding = [&](const tagBuilding& b) {
+        int width = (b.Type == BUILDING_HOME || b.Type == BUILDING_ARROWTOWER ||
+                     b.Type == BUILDING_DOCK) ? SIZELEN_SMALL : SIZELEN_MIDDLE;
+        return overlaps(b.BlockDR,b.BlockUR,width,1);
+    };
+    for(const auto& b : info.buildings) if(blocksBuilding(b)) return reject("friendly_building");
+    for(const auto& b : info.enemy_buildings) if(blocksBuilding(b)) return reject("enemy_building");
+    for(const auto& r : info.resources)
+    {
+        int width = (r.Type == RESOURCE_STONE || r.Type == RESOURCE_GOLD ||
+                     r.Type == RESOURCE_FISH) ? SIZELEN_SMALL : SIZELEN_SINGEL;
+        if(overlaps(r.BlockDR,r.BlockUR,width,0)) return reject("resource");
+    }
+    // 下单前避开现场单位；引擎仍会在下一帧检查真实占用。
+    for(const auto& f : info.farmers) if(overlaps(f.BlockDR,f.BlockUR,1,0)) return reject("friendly_farmer");
+    for(const auto& f : info.enemy_farmers) if(overlaps(f.BlockDR,f.BlockUR,1,0)) return reject("enemy_farmer");
+    for(const auto& a : info.armies) if(overlaps(a.BlockDR,a.BlockUR,1,0)) return reject("friendly_army");
+    for(const auto& a : info.enemy_armies) if(overlaps(a.BlockDR,a.BlockUR,1,0)) return reject("enemy_army");
+    return true;
+}
+
 // 以(cDR,cUR)块为中心、半径 [minR,maxR] 环上找一块3x3可建平地
 // 8个方向轮流作为搜索起点（静态旋转量），避免连续建造死磕同一格
 // 地形要求：3x3全草地(非海洋)、高度一致、不压已有建筑/静态资源
@@ -202,43 +294,7 @@ bool usrFindFlatNear(int &outDR, int &outUR, const tagInfo& info,
         {
             const auto& offset = ring[(k + rotation) % ring.size()];
             int dr = cDR + offset.first, ur = cUR + offset.second;
-            if(dr < 2 || ur < 2 || dr >= rows-2 || ur >= cols-2) continue;
-            if(g_failedBuildSites.count(dr * 1000 + ur)) continue;
-
-            bool ok = true;
-            for(int i=-1; i<=1 && ok; i++)
-                for(int j=-1; j<=1 && ok; j++)
-                {
-                    int t = (*info.theMap)[dr+i][ur+j].type;
-                    if(t != MAPPATTERN_GRASS) ok = false;   // 海洋/沙漠等一律不建
-                }
-            if(!ok) continue;
-
-            int h = (*info.theMap)[dr][ur].height;
-            for(int i=-1; i<=1 && ok; i++)
-                for(int j=-1; j<=1 && ok; j++)
-                    if((*info.theMap)[dr+i][ur+j].height != h) ok = false;
-            if(!ok) continue;
-
-            // 市镇中心附近保留十字通道，避免后期建筑围住交货路线。
-            if(g_tcDR >= 0 && g_tcUR >= 0 &&
-               usrBlockDist(dr, ur, g_tcDR, g_tcUR) <= 14.0 &&
-               (abs(dr-g_tcDR) <= 2 || abs(ur-g_tcUR) <= 2))
-                continue;
-
-            bool busy = false;
-            // 建筑中心至少相隔4格。建筑通常占3x3，这会在建筑之间留出通行空间。
-            for(const auto& b : info.buildings)           // 避开所有建筑(含在建)
-                if(abs(b.BlockDR-dr) <= 3 && abs(b.BlockUR-ur) <= 3) { busy = true; break; }
-            if(busy) continue;
-            for(const auto& rs : info.resources)          // 只避开静态资源，动物会走动不拦
-            {
-                if(rs.Type != RESOURCE_TREE && rs.Type != RESOURCE_BUSH &&
-                   rs.Type != RESOURCE_STONE && rs.Type != RESOURCE_GOLD) continue;
-                if(rs.BlockDR < 0 || rs.BlockUR < 0) continue;
-                if(abs(rs.BlockDR-dr) <= 1 && abs(rs.BlockUR-ur) <= 1) { busy = true; break; }
-            }
-            if(busy) continue;
+            if(!buildSiteClear(info, dr, ur)) continue;
 
             outDR = dr; outUR = ur;
             rotation = (rotation + 7) % (int)ring.size();
@@ -446,8 +502,19 @@ static void processBuildResults(const tagInfo& info)
         }
         else
         {
-            g_failedBuildSites.insert(build.dr*1000 + build.ur);
-            dbg(QString("[建造恢复] 指令失败，跳过位置(%1,%2)").arg(build.dr).arg(build.ur));
+            if(build.type == BUILDING_ARROWTOWER && result != info.ins_ret.end() &&
+               result->second == ACTION_INVALID_HUMANBUILD_OVERLAP)
+            {
+                g_towerSiteRetryAfter[build.dr*1000+build.ur] = g_aiframe+SEC(12);
+                dbg(QString("[第二箭塔失败] order=%1 result=%2 position=(%3,%4) retryAfter=%5")
+                          .arg(it->first).arg(result->second).arg(build.dr).arg(build.ur)
+                          .arg(g_aiframe+SEC(12)));
+            }
+            else
+            {
+                g_failedBuildSites.insert(build.dr*1000 + build.ur);
+                dbg(QString("[建造恢复] 指令失败，跳过位置(%1,%2)").arg(build.dr).arg(build.ur));
+            }
         }
         it = g_pendingBuild.erase(it);
     }
@@ -608,7 +675,6 @@ static int findFreeFarm(const tagInfo& info, int farmerSN = -1)
 }
 
 static int berryFoodNearBase(const tagInfo& info);
-static bool isCompletedFarm(const tagInfo& info, int sn);
 static int chooseBerryWorkerFoodTarget(const tagInfo& info, const tagFarmer& farmer);
 static bool farmerHasPendingGatherOrder(int sn);
 
@@ -702,9 +768,40 @@ static void refreshPriestPoint()
     g_priestPointUR = ty + dy / L * PRIEST_BEHIND_TOWER_BLOCKS * BLOCKSIDELENGTH;
 }
 
-// 若TC附近出现另一座已建成箭塔，把主防塔切换到近塔
+// 前两波沿用原塔选择规则；第二波后登记备用塔，主塔失守时才切换。
 static void refreshDefTower(const tagInfo& info)
 {
+    // 第二座塔完成时保持原主塔站位；只有原塔失守，才切换到存活的备用塔。
+    if(g_wave2Handled)
+    {
+        const tagBuilding* backup = nullptr;
+        for(const auto& b : info.buildings)
+            if(b.Type == BUILDING_ARROWTOWER && b.SN != g_defTowerSN &&
+               b.Percent >= 100 && b.Blood > 0 &&
+               usrBlockDist(b.BlockDR, b.BlockUR, g_defTowerDR, g_defTowerUR)
+                   <= SECOND_TOWER_MAX_DISTANCE)
+                if(!backup || b.SN < backup->SN) backup = &b;
+        g_backupTowerSN = backup ? backup->SN : -1;
+        if(backup && !g_secondTowerBuilt)
+        {
+            g_secondTowerBuilt = true;
+            dbg(QString("[第二箭塔完成] sn=%1 position=(%2,%3) frame=%4")
+                      .arg(backup->SN).arg(backup->BlockDR).arg(backup->BlockUR).arg(g_aiframe));
+        }
+        const tagBuilding* main = getBuilding(info, g_defTowerSN);
+        if(backup && (!main || main->Blood <= 0))
+        {
+            g_defTowerSN = backup->SN;
+            g_defTowerDR = backup->BlockDR; g_defTowerUR = backup->BlockUR;
+            g_backupTowerSN = -1;
+            g_priestDangerRetreat = false; g_priestDangerAttacker = -1;
+            g_priestLastMoveFrame = -1000;
+            g_towerLastAttackTarget = -1; g_towerLastAttackFrame = -1000;
+            dbg(QString("[主塔失守切换] tower=%1 position=(%2,%3)")
+                      .arg(g_defTowerSN).arg(g_defTowerDR).arg(g_defTowerUR));
+        }
+        return;
+    }
     double tcx = g_tcDR * BLOCKSIDELENGTH, tcy = g_tcUR * BLOCKSIDELENGTH;
     int nearSN = -1; double best = 8*8;
     for(const auto& b : info.buildings)
@@ -979,7 +1076,7 @@ static void assignNewFarmer(const tagInfo& info)
     else if(role == ROLE_BUSH)
     {
         t = chooseBerryWorkerFoodTarget(info, *fp);
-        if(isCompletedFarm(info, t)) role = ROLE_FARM;
+        if(usableFarmTarget(info, t)) role = ROLE_FARM;
         if(t < 0)
         {
             // 食物目标暂时不存在时先伐木，但仍保留其核心食物工身份；
@@ -988,13 +1085,6 @@ static void assignNewFarmer(const tagInfo& info)
         }
     }
     else if(role == ROLE_HUNTER) t = g_huntTargetSN; // 仅用于日志，会合前不攻击
-    else if(role == ROLE_GOLD)   t = usrBestGatherResource(info, RESOURCE_GOLD, *fp);
-    else if(role == ROLE_STONE)  t = usrBestGatherResource(info, RESOURCE_STONE, *fp);
-    else if(role == ROLE_FARM)
-    {
-        t = findFreeFarm(info);                          // 只去没人种的田
-        if(t == -1) t = usrBestGatherResource(info, RESOURCE_BUSH, *fp);
-    }
     g_role[sn] = role;
     if(t != -1 && role != ROLE_HUNTER) orderAction(info, sn, t);
 
@@ -1263,11 +1353,108 @@ static bool hasPendingBuildType(int type)
     return false;
 }
 
+static const tagBuilding* scoreStockBuilding(const tagInfo& info)
+{
+    if(g_scoreStock.dr < 0) return nullptr;
+    for(const auto& building : info.buildings)
+        if(building.Type == BUILDING_STOCK && building.Blood > 0 &&
+           building.BlockDR == g_scoreStock.dr && building.BlockUR == g_scoreStock.ur)
+            return &building;
+    return nullptr;
+}
+
+// 在原有建造回执处理后观察完工；即使补田或防守暂停队列，也不会漏记完成。
+static void processScoreStockProgress(const tagInfo& info)
+{
+    if(g_scoreStock.dr < 0) return;
+    const tagBuilding* building = scoreStockBuilding(info);
+    if(building && building->Percent < 100) return;
+    if(!building && hasPendingBuildType(BUILDING_STOCK)) return;
+    if(building)
+    {
+        ++g_scoreStock.completed;
+        dbg(QString("[加分仓库完成] sn=%1 completed=%2/%3 frame=%4")
+                  .arg(building->SN).arg(g_scoreStock.completed)
+                  .arg(TARGET_SCORE_STOCKS).arg(g_aiframe));
+        if(g_scoreStock.completed == TARGET_SCORE_STOCKS)
+            dbg(QString("[加分建造结束] completed=%1/%2")
+                      .arg(g_scoreStock.completed).arg(TARGET_SCORE_STOCKS));
+    }
+    else
+    {
+        // 指令失败、地基未出现或被摧毁：不计完成，沿用原有黑名单和回执恢复。
+        g_scoreStock.retryAfter = g_aiframe + SCORE_BUILD_RETRY_INTERVAL;
+        dbg(QString("[加分仓库恢复] position=(%1,%2) completed=%3/%4")
+                  .arg(g_scoreStock.dr).arg(g_scoreStock.ur)
+                  .arg(g_scoreStock.completed).arg(TARGET_SCORE_STOCKS));
+    }
+    g_scoreStock.dr = g_scoreStock.ur = -1;
+}
+
+// 只由建造队列末尾调用，房屋、补田和原有经济建设始终先执行。
+static void manageScoreStockBuild(const tagInfo& info, const tagFarmer& builder)
+{
+    if(!g_wave3Handled || g_defenseMode || builder.Blood <= 0 ||
+       g_scoreStock.completed >= TARGET_SCORE_STOCKS || !snFree(builder.SN) ||
+       enemyTargetingFarmer(info, builder.SN) != -1 ||
+       hasPendingBuildType(BUILDING_STOCK) || g_acceptedBuild.count(builder.SN)) return;
+    for(const auto& order : g_pendingBuild)
+        if(order.second.builder == builder.SN) return;
+
+    // 六名存活的核心食物工必须各有一片仍能产粮的田，避免加分建设延误食物接续。
+    set<int> occupiedFarms;
+    for(int sn : g_berryFarmWorkers)
+    {
+        const tagFarmer* worker = usrGetFarmer(info, sn);
+        if(worker && worker->Blood > 0 && usableFarmTarget(info, worker->WorkObjectSN))
+            occupiedFarms.insert(worker->WorkObjectSN);
+    }
+    if((int)occupiedFarms.size() < TARGET_BERRY_FARM_WORKERS) return;
+
+    // 高优先级任务中断施工后，先续建同一座仓库，不另建新地基。
+    if(const tagBuilding* building = scoreStockBuilding(info))
+    {
+        orderBuilderWork(builder.SN, building->SN);
+        return;
+    }
+    if(g_aiframe < g_scoreStock.retryAfter ||
+       info.Wood < SCORE_BUILD_WOOD_RESERVE + COST_STOCK_WOOD) return;
+    if(!g_scoreStock.started)
+    {
+        g_scoreStock.started = true;
+        dbg(QString("[加分建造开始] target=%1").arg(TARGET_SCORE_STOCKS));
+    }
+    g_scoreStock.retryAfter = g_aiframe + SCORE_BUILD_RETRY_INTERVAL;
+    int dr, ur;
+    if(!usrFindFlatNear(dr, ur, info, g_tcDR, g_tcUR, 5, 16))
+    {
+        dbg(QString("[加分选址等待] completed=%1/%2 retryAfter=%3")
+                  .arg(g_scoreStock.completed).arg(TARGET_SCORE_STOCKS)
+                  .arg(g_scoreStock.retryAfter));
+        return;
+    }
+    orderBuild(builder.SN, BUILDING_STOCK, dr, ur);
+    g_scoreStock.dr = dr; g_scoreStock.ur = ur;
+    dbg(QString("[加分仓库下单] position=(%1,%2) completed=%3/%4 frame=%5")
+              .arg(dr).arg(ur).arg(g_scoreStock.completed)
+              .arg(TARGET_SCORE_STOCKS).arg(g_aiframe));
+}
+
 static const tagBuilding* unfinishedBuilding(const tagInfo& info, int type)
 {
     for(const auto& building : info.buildings)
         if(building.Type == type && building.Percent < 100)
             return &building;
+    return nullptr;
+}
+
+static const tagBuilding* unfinishedSecondTower(const tagInfo& info)
+{
+    for(const auto& b : info.buildings)
+        if(b.Type == BUILDING_ARROWTOWER && b.SN != g_defTowerSN &&
+           b.Blood > 0 && b.Percent < 100 &&
+           usrBlockDist(b.BlockDR, b.BlockUR, g_defTowerDR, g_defTowerUR)
+               <= SECOND_TOWER_MAX_DISTANCE) return &b;
     return nullptr;
 }
 
@@ -1392,7 +1579,7 @@ static void manageBerryFarmWorkers(const tagInfo& info)
            farmerHasPendingGatherOrder(sn)) continue;
         auto role = g_role.find(sn);
         if(role == g_role.end()) continue;
-        if(role->second == ROLE_FARM && isCompletedFarm(info, farmer->WorkObjectSN))
+        if(role->second == ROLE_FARM && usableFarmTarget(info, farmer->WorkObjectSN))
             continue;
 
         const tagResource* current = getRes(info, farmer->WorkObjectSN);
@@ -1406,7 +1593,7 @@ static void manageBerryFarmWorkers(const tagInfo& info)
         int target = chooseBerryWorkerFoodTarget(info, *farmer);
         if(target < 0 || farmer->WorkObjectSN == target) continue;
 
-        role->second = isCompletedFarm(info, target) ? ROLE_FARM : ROLE_BUSH;
+        role->second = usableFarmTarget(info, target) ? ROLE_FARM : ROLE_BUSH;
         g_farmerGatherTargets.erase(sn);
         orderAction(info, sn, target);
         dbg(QString("[核心食物工] farmer=%1 target=%2 role=%3")
@@ -1444,6 +1631,142 @@ static void manageGoldMiners(const tagInfo& info)
     }
 }
 
+// 仅第二波结束后准备第二座塔；临时采石工不占用建筑工、食物工和猎人。
+static void manageTowerStoneWorkers(const tagInfo& info)
+{
+    if(!g_wave2Handled) return;
+    bool ordering = hasPendingBuildType(BUILDING_ARROWTOWER);
+    bool building = ordering || unfinishedSecondTower(info);
+    int targetStone = building ? SECOND_TOWER_REPAIR_RESERVE :
+                                COST_SECOND_TOWER_STONE + SECOND_TOWER_REPAIR_RESERVE;
+    // 下单帧的资源尚未扣款，不能据此把采石工撤回、下一帧又重新招人。
+    bool needStone = !g_secondTowerBuilt && (ordering || info.Stone < targetStone);
+    for(auto it=g_towerStoneWorkers.begin(); it!=g_towerStoneWorkers.end(); )
+    {
+        const tagFarmer* f = usrGetFarmer(info, *it);
+        if(!f || f->Blood <= 0 || g_role[*it] != ROLE_STONE)
+        { it = g_towerStoneWorkers.erase(it); continue; }
+        if(!needStone && snFree(f->SN) && !farmerHasPendingGatherOrder(f->SN) &&
+           enemyTargetingFarmer(info, f->SN) == -1)
+        {
+            int tree = usrBestGatherResource(info, RESOURCE_TREE, *f);
+            if(tree < 0) return;
+            g_role[f->SN] = ROLE_WOOD;
+            g_farmerGatherTargets.erase(f->SN);
+            orderAction(info, f->SN, tree);
+            dbg(QString("[第二箭塔采石结束] farmer=%1 stone=%2，恢复伐木").arg(f->SN).arg(info.Stone));
+            g_towerStoneWorkers.erase(it);
+            return;
+        }
+        ++it;
+    }
+    if(!needStone || (int)g_towerStoneWorkers.size() >= SECOND_TOWER_STONE_WORKERS) return;
+    for(const auto& f : info.farmers)
+        if(f.FarmerSort == FARMERTYPE_FARMER && f.Blood > 0 && f.SN != g_builderSN &&
+           g_role.count(f.SN) && g_role[f.SN] == ROLE_WOOD && !g_berryFarmWorkers.count(f.SN) &&
+           snFree(f.SN) && !farmerHasPendingGatherOrder(f.SN) && enemyTargetingFarmer(info, f.SN) == -1)
+        {
+            int stone = usrBestGatherResource(info, RESOURCE_STONE, f);
+            if(stone < 0) return;
+            g_role[f.SN] = ROLE_STONE;
+            g_towerStoneWorkers.insert(f.SN);
+            g_farmerGatherTargets.erase(f.SN);
+            orderAction(info, f.SN, stone);
+            dbg(QString("[第二箭塔采石分配] farmer=%1 target=%2 stone=%3/%4")
+                      .arg(f.SN).arg(stone).arg(info.Stone).arg(targetStone));
+            return;
+        }
+}
+
+// 紧急人口房之后优先补塔；旧建筑正在施工时先等它完成，不另开并行任务。
+static bool manageSecondTowerBuild(const tagInfo& info, const tagFarmer& builder)
+{
+    if(!g_wave2Handled || g_secondTowerBuilt || !g_towerTechDone) return false;
+    if(hasPendingBuildType(BUILDING_ARROWTOWER)) return true;
+    if(const tagBuilding* tower = unfinishedSecondTower(info))
+    {
+        if(builder.WorkObjectSN != tower->SN && snFree(builder.SN))
+        {
+            orderBuilderWork(builder.SN, tower->SN);
+            dbg(QString("[第二箭塔续建] builder=%1 tower=%2 percent=%3")
+                      .arg(builder.SN).arg(tower->SN).arg(tower->Percent));
+        }
+        return true;
+    }
+    if(builder.NowState != HUMAN_STATE_IDLE || !snFree(builder.SN)) return false;
+    if(g_acceptedBuild.count(builder.SN)) return true;
+    for(const auto& p : g_pendingBuild) if(p.second.builder == builder.SN) return true;
+    // 已有采石工和可采石矿时，空闲建筑工等预算，不再先开一片田拖延80秒建塔。
+    // 没有石矿或可用采石工则继续原经济队列，避免无限等待。
+    if(info.Stone < COST_SECOND_TOWER_STONE)
+        return !g_towerStoneWorkers.empty() &&
+               usrNearestResource(info, RESOURCE_STONE, builder.DR, builder.UR, false) >= 0;
+    if(g_aiframe-lastTry(BUILDING_ARROWTOWER) < 50) return true;
+    g_lastBuildTry[BUILDING_ARROWTOWER] = g_aiframe;
+
+    // 优先原塔侧前方；没有合法位置时再找侧后方，仍保持射程与祭司站位覆盖。
+    double bx = g_tcDR-g_defTowerDR, by = g_tcUR-g_defTowerUR;
+    double length = sqrt(bx*bx+by*by);
+    if(length < 0.5) { bx = 1; by = 0; length = 1; }
+    bx /= length; by /= length;
+    double rearDR = g_defTowerDR + bx*PRIEST_BEHIND_TOWER_BLOCKS;
+    double rearUR = g_defTowerUR + by*PRIEST_BEHIND_TOWER_BLOCKS;
+    double idealDR = g_defTowerDR-bx-by*4, idealUR = g_defTowerUR-by+bx*4;
+    int bestDR = -1, bestUR = -1;
+    double best = 1e30;
+    map<QString,int> rejected[2];
+    map<QString,pair<int,int>> examples[2];
+    for(int pass=0; pass<2 && bestDR<0; ++pass)
+        for(int dx=-SECOND_TOWER_MAX_DISTANCE; dx<=SECOND_TOWER_MAX_DISTANCE; ++dx)
+            for(int dy=-SECOND_TOWER_MAX_DISTANCE; dy<=SECOND_TOWER_MAX_DISTANCE; ++dy)
+            {
+                int dr = g_defTowerDR+dx, ur = g_defTowerUR+dy;
+                const char* reason = nullptr;
+                if(pass==0 && dx*bx+dy*by > 0.5) reason = "front_direction";
+                else if(blockLen(dx,dy) > SECOND_TOWER_MAX_DISTANCE) reason = "tower_distance";
+                else if(d2(dr,ur,rearDR,rearUR) > TOWER_ATTACK_RANGE_BLOCKS*TOWER_ATTACK_RANGE_BLOCKS)
+                    reason = "priest_coverage";
+                else secondTowerSiteClear(info,dr,ur,&reason);
+                if(reason)
+                {
+                    if(++rejected[pass][reason] == 1) examples[pass][reason] = {dr,ur};
+                    continue;
+                }
+                double distance = d2(dr,ur,idealDR,idealUR);
+                if(distance < best) { best = distance; bestDR = dr; bestUR = ur; }
+            }
+    static int lastSiteFailureLogFrame = -1;
+    if(bestDR >= 0)
+    {
+        lastSiteFailureLogFrame = -1;
+        orderBuild(builder.SN, BUILDING_ARROWTOWER, bestDR, bestUR);
+        dbg(QString("[第二箭塔下单] builder=%1 position=(%2,%3) stone=%4 frame=%5")
+                  .arg(builder.SN).arg(bestDR).arg(bestUR).arg(info.Stone).arg(g_aiframe));
+    }
+    else if(lastSiteFailureLogFrame < 0 || g_aiframe-lastSiteFailureLogFrame >= SEC(24))
+    {
+        lastSiteFailureLogFrame = g_aiframe;
+        dbg(QString("[第二箭塔等待] 尚无合法重叠位置，保留通道并跳过失败坐标"));
+        // 两轮分别统计；每个位置只计首个排除原因，@(x,y)是该原因的一个样本。
+        QStringList passes;
+        for(int pass=0; pass<2; ++pass)
+        {
+            QStringList counts;
+            for(const auto& entry : rejected[pass])
+            {
+                const auto& point = examples[pass][entry.first];
+                counts << QString("%1=%2@(%3,%4)").arg(entry.first).arg(entry.second)
+                          .arg(point.first).arg(point.second);
+            }
+            passes << QString("%1:{%2}").arg(pass==0 ? "front" : "fallback").arg(counts.join(" "));
+        }
+        dbg(QString("[第二箭塔选址失败] frame=%1 builder=%2 wood=%3 stone=%4 main=(%5,%6) tc=(%7,%8) %9")
+                  .arg(g_aiframe).arg(builder.SN).arg(info.Wood).arg(info.Stone)
+                  .arg(g_defTowerDR).arg(g_defTowerUR).arg(g_tcDR).arg(g_tcUR).arg(passes.join(" ")));
+    }
+    return bestDR >= 0; // 无合法位置时不锁死后续经济任务。
+}
+
 // 前两波仍暂停建设保塔；之后只在建筑工附近有敌军或需要可执行的修塔时暂停。
 static bool pauseEconomicBuilds(const tagInfo& info)
 {
@@ -1459,6 +1782,7 @@ static bool pauseEconomicBuilds(const tagInfo& info)
                g_tcUR*BLOCKSIDELENGTH) <= radius*radius)) return true;
     const tagBuilding* tower = getBuilding(info, g_defTowerSN);
     return tower && tower->Blood > 0 && tower->Blood < tower->MaxBlood && info.Stone > 0 &&
+           !hasPendingBuildType(BUILDING_ARROWTOWER) && !unfinishedSecondTower(info) &&
            !hasPendingBuildType(BUILDING_HOME) && !unfinishedBuilding(info, BUILDING_HOME);
 }
 
@@ -1568,6 +1892,7 @@ static void builderQueue(const tagInfo& info, bool emergencyOnly)
         return;
     }
 
+    if(manageSecondTowerBuild(info, *bf)) return;
     if(bf->NowState != HUMAN_STATE_IDLE) return;
 
     // 防守撤退等情况可能中断前置建筑施工。回去续建，不能另起一座导致升铜延误。
@@ -1747,6 +2072,7 @@ static void builderQueue(const tagInfo& info, bool emergencyOnly)
         return;
     }
 
+    manageScoreStockBuild(info, *bf);
 }
 
 // ====================== 9. 科技 / 升时代 / 造兵 ======================
@@ -1921,25 +2247,59 @@ static void techAndProduction(const tagInfo& info)
     }
 }
 
-// 第三波提前拦截进入主塔保护范围的投石车，不等它开始轰塔；离开范围则撤回。
+// 第三波普通目标在14格内发起拦截；锁定存活箭塔的目标可在主塔22格内救援。
+// 已选中的目标仍沿用主塔22格退出边界。
 // 箭塔被毁后仍以已保存的塔坐标判断范围，直到附近投石车被消灭或转化。
+static bool siegeLocksLiveTower(const tagArmy& enemy, const tagBuilding* main,
+                               const tagBuilding* backup)
+{
+    for(const tagBuilding* tower : {main, backup})
+        if(tower && tower->Type == BUILDING_ARROWTOWER && tower->Percent >= 100 &&
+           tower->Blood > 0 && enemy.WorkObjectSN == tower->SN) return true;
+    return false;
+}
+
 static const tagArmy* findTowerSiege(const tagInfo& info, double fromDR, double fromUR,
-                                   double rangeBlocks, int preferredSN = -1)
+                                   double rangeBlocks, int preferredSN = -1,
+                                   bool keepIntercept = false)
 {
     if(!g_defenseMode || !g_wave2Handled || g_activeDefenseWave < 3) return nullptr;
     if(g_defTowerDR < 0 || g_defTowerUR < 0) return nullptr;
-    const double radius = SIEGE_INTERCEPT_RADIUS_BLOCKS * BLOCKSIDELENGTH;
     const double range = rangeBlocks * BLOCKSIDELENGTH;
+    const tagBuilding* main = getBuilding(info, g_defTowerSN);
+    const tagBuilding* backup = getBuilding(info, g_backupTowerSN);
+    const bool liveMain = main && main->Percent >= 100 && main->Blood > 0;
+    const bool liveBackup = backup && backup->Percent >= 100 && backup->Blood > 0;
     const tagArmy* best = nullptr;
     double bestDistance = 1e30;
     for(const auto& enemy : info.enemy_armies)
     {
+        bool continuing = keepIntercept && enemy.SN == preferredSN;
+        double radius = (continuing ? DEFENSE_SAFE_CORE_BLOCKS :
+                         SIEGE_INTERCEPT_RADIUS_BLOCKS) * BLOCKSIDELENGTH;
         if(enemy.Sort != AT_STONE_THROWER || enemy.Blood <= 0 ||
-           (g_priestSN != -1 && enemy.WorkObjectSN == g_priestSN && enemy.SN != preferredSN) ||
-           d2(enemy.DR, enemy.UR, g_defTowerDR*BLOCKSIDELENGTH,
-              g_defTowerUR*BLOCKSIDELENGTH) > radius*radius) continue;
+           (g_priestSN != -1 && enemy.WorkObjectSN == g_priestSN && enemy.SN != preferredSN)) continue;
+        double areaDistance = d2(enemy.DR, enemy.UR, g_defTowerDR*BLOCKSIDELENGTH,
+                                 g_defTowerUR*BLOCKSIDELENGTH);
+        const double mainDistance = areaDistance;
+        if(keepIntercept && !continuing)
+        {
+            // 士兵的新目标覆盖两座存活塔各自14格；已有目标仍沿用22格退出边界。
+            // 两塔都毁时保留原来的塔址防区，不能打断塔毁后的应急拦截。
+            if(!liveMain && liveBackup) areaDistance = 1e30;
+            if(liveBackup)
+                areaDistance = min(areaDistance, d2(enemy.DR, enemy.UR,
+                    backup->BlockDR*BLOCKSIDELENGTH, backup->BlockUR*BLOCKSIDELENGTH));
+        }
+        // 已锁定存活箭塔的新目标可在主塔22格防区内救援，不扩大祭司施法范围。
+        const double rescueRadius = DEFENSE_SAFE_CORE_BLOCKS * BLOCKSIDELENGTH;
+        bool towerRescue = keepIntercept && !continuing &&
+            siegeLocksLiveTower(enemy, main, backup) &&
+            mainDistance <= rescueRadius*rescueRadius;
+        if(areaDistance > radius*radius && !towerRescue) continue;
         double distance = d2(fromDR, fromUR, enemy.DR, enemy.UR);
-        if(distance > range*range) continue;
+        // 士兵已通过双塔防区检查，不能再按主塔位置过滤；祭司仍限定自身施法距离。
+        if(!keepIntercept && distance > range*range) continue;
         if(enemy.SN == preferredSN) return &enemy;
         if(distance < bestDistance) { best = &enemy; bestDistance = distance; }
     }
@@ -2069,8 +2429,19 @@ static void managePriest(const tagInfo& info)
                 dbg(QString("[祭司追兵脱离] attacker=%1 已停止锁定，防守期间保持塔后2格")
                           .arg(g_priestDangerAttacker));
 
-            if(d2(p->DR, p->UR, g_priestRetreatDR, g_priestRetreatUR) >
-               1.0*1.0*BLOCKSIDELENGTH*BLOCKSIDELENGTH)
+            // 碰撞可能让祭司停在撤退点外1.22格。追兵脱离后，活塔附近允许
+            // 1.5格到位误差，避免无限补移动、无法转换；塔毁时保留原判断。
+            const double retreatDistance = d2(p->DR, p->UR,
+                                              g_priestRetreatDR, g_priestRetreatUR);
+            const double tolerance = PRIEST_RETREAT_ARRIVAL_TOLERANCE_BLOCKS * BLOCKSIDELENGTH;
+            const double towerDistance = (PRIEST_EMERGENCY_BEHIND_TOWER_BLOCKS +
+                                          PRIEST_RETREAT_ARRIVAL_TOLERANCE_BLOCKS) * BLOCKSIDELENGTH;
+            const tagBuilding* tower = getBuilding(info, g_defTowerSN);
+            bool canConvertNearby = tower && tower->Percent >= 100 && tower->Blood > 0 &&
+                retreatDistance <= tolerance*tolerance &&
+                d2(p->DR, p->UR, tower->BlockDR*BLOCKSIDELENGTH,
+                   tower->BlockUR*BLOCKSIDELENGTH) <= towerDistance*towerDistance;
+            if(retreatDistance > BLOCKSIDELENGTH*BLOCKSIDELENGTH && !canConvertNearby)
             {
                 if(g_aiframe-g_priestLastMoveFrame >= 75)
                 {
@@ -2134,12 +2505,35 @@ static void managePriest(const tagInfo& info)
         if(p->NowState == HUMAN_STATE_ATTACKING) return;
         // 冷却没好不能转
         if(p->ConvertCooldown != 0) return;
-        // 必须等箭塔拥有一个仍然有效的攻击目标。
+        double range12 = 12.0*12.0*BLOCKSIDELENGTH*BLOCKSIDELENGTH;
+        const tagBuilding* tower = getBuilding(info, g_defTowerSN);
+        bool towerLostThirdWave = g_wave2Handled && g_activeDefenseWave >= 3 &&
+                                  (!tower || tower->Blood <= 0);
+        if(towerLostThirdWave)
+        {
+            // 塔毁后没有Project可跟随：只选当前位置12格内的存活敌军，
+            // 优先远程兵，同级选最近者；不追出射程，遇险仍由上面的分支处理。
+            towerTarget = -1;
+            int bestPriority = 99;
+            double bestDistance = range12;
+            for(const auto& enemy : info.enemy_armies)
+            {
+                if(enemy.Blood <= 0) continue;
+                double distance = d2(p->DR, p->UR, enemy.DR, enemy.UR);
+                if(distance > range12) continue;
+                int priority = isDangerousRangedEnemy(enemy.Sort) ? 0 : 1;
+                if(priority < bestPriority ||
+                   (priority == bestPriority && distance < bestDistance))
+                {
+                    towerTarget = enemy.SN;
+                    bestPriority = priority;
+                    bestDistance = distance;
+                }
+            }
+        }
         if(towerTarget == -1) return;
 
-        // 箭塔射程与塔后4格站位保证大多数目标会进入祭司12格转换射程；
-        // 目标尚未进入射程时继续等待，不改转其他敌人。
-        double range12 = 12.0*12.0*BLOCKSIDELENGTH*BLOCKSIDELENGTH;
+        // 塔仍存活时继续跟随它的攻击目标，目标不在12格内就等待。
         const tagArmy* targetArmy = nullptr;
         for(const auto& e : info.enemy_armies)
             if(e.SN == towerTarget) { targetArmy = &e; break; }
@@ -2148,7 +2542,8 @@ static void managePriest(const tagInfo& info)
         {
             orderAction(info, g_priestSN, towerTarget);
             g_priestConvertTarget = towerTarget;
-            dbg(QString("[祭司] 箭塔目标=%1，祭司开始转换").arg(towerTarget));
+            dbg(QString(towerLostThirdWave ? "[祭司塔毁后转换] target=%1，原地转换" :
+                        "[祭司] 箭塔目标=%1，祭司开始转换").arg(towerTarget));
         }
         return;
     }
@@ -2264,11 +2659,6 @@ static int berryFoodNearBase(const tagInfo& info)
             total += resource.Cnt;
     }
     return total;
-}
-
-static bool isCompletedFarm(const tagInfo& info, int sn)
-{
-    return usableFarmTarget(info, sn);
 }
 
 // 六名核心食物工先采浆果；浆果耗尽后帮助处理已经击杀的瞪羚；
@@ -2422,6 +2812,12 @@ static void updateDefense(const tagInfo& info)
                           .arg(TARGET_LAND_FARMERS));
             else
                 dbg(QString("[防守] 当前波次威胁解除"));
+            // 仅记录现有安全判定确认的第三波结束，本轮不改变探路行为。
+            if(clearedWave == 3 && !g_wave3Handled)
+            {
+                g_wave3Handled = true;
+                dbg(QString("[第三波完成] 允许后期探路"));
+            }
         }
     }
 
@@ -2459,6 +2855,13 @@ static bool isDangerousRangedEnemy(int sort)
            sort == AT_COMPOSITE_BOWMAN || sort == AT_CHARIOT_ARCHER;
 }
 
+static bool targetingLiveDefenseTower(const tagInfo& info, int sn)
+{
+    if(sn != g_defTowerSN && sn != g_backupTowerSN) return false;
+    const tagBuilding* tower = getBuilding(info, sn);
+    return tower && tower->Percent >= 100 && tower->Blood > 0;
+}
+
 // 第二波让箭塔承担主要伤害。人口房没有待处理任务时，固定建筑工持续维修箭塔；
 // 建筑工自己被锁定时仍由村民撤退逻辑接管。
 static void manageCombatTowerRepair(const tagInfo& info)
@@ -2481,6 +2884,9 @@ static void manageCombatTowerRepair(const tagInfo& info)
 
     // 紧急人口房和已经开工的房屋仍优先，不能把房屋建到一半永久丢下。
     if(hasPendingBuildType(BUILDING_HOME) || unfinishedBuilding(info, BUILDING_HOME)) return;
+    // 第二座塔已经开工时先完成它，不能被主塔维修反复抢走建筑工。
+    if(g_wave2Handled && (hasPendingBuildType(BUILDING_ARROWTOWER) ||
+                         unfinishedSecondTower(info))) return;
     if(enemyTargetingFarmer(info, g_builderSN) != -1 || !snFree(g_builderSN)) return;
     if(g_aiframe-g_lastCombatTowerRepairFrame < 100) return;
 
@@ -2526,7 +2932,7 @@ static void manageDefenseTower(const tagInfo& info)
                              tower->BlockDR*BLOCKSIDELENGTH,
                              tower->BlockUR*BLOCKSIDELENGTH);
         if(isDangerousRangedEnemy(enemy.Sort) &&
-           enemy.WorkObjectSN != g_defTowerSN && distance <= watch2)
+           !targetingLiveDefenseTower(info, enemy.WorkObjectSN) && distance <= watch2)
             unsecuredRangedNearby = true;
 
         if(enemy.WorkObjectSN != g_priestSN) continue;
@@ -2576,7 +2982,7 @@ static void manageDefenseTower(const tagInfo& info)
     for(const auto& enemy : info.enemy_armies)
     {
         if(!isDangerousRangedEnemy(enemy.Sort) ||
-           enemy.WorkObjectSN == g_defTowerSN) continue;
+           targetingLiveDefenseTower(info, enemy.WorkObjectSN)) continue;
         double distance = d2(enemy.DR, enemy.UR,
                              tower->BlockDR*BLOCKSIDELENGTH,
                              tower->BlockUR*BLOCKSIDELENGTH);
@@ -2636,7 +3042,7 @@ static void manageDefenseTower(const tagInfo& info)
         int priority = 3;
         if(isDangerousRangedEnemy(e.Sort)) priority = 0;
         else if(usrGetFarmer(info, e.WorkObjectSN)) priority = 1;
-        else if(e.WorkObjectSN == g_defTowerSN) priority = 2;
+        else if(targetingLiveDefenseTower(info, e.WorkObjectSN)) priority = 2;
         if(priority < bestPriority || (priority == bestPriority && dd < bestDistance))
         {
             target = &e;
@@ -2667,6 +3073,41 @@ static void manageDefenseTower(const tagInfo& info)
               .arg(g_defTowerSN).arg(target->SN).arg(target->WorkObjectSN));
 }
 
+// 备用塔只处理自身7格内的敌军。主塔照旧供祭司跟随，备用塔补拉其他追兵。
+static void manageBackupTower(const tagInfo& info)
+{
+    if(!g_wave2Handled || !g_defenseMode || g_backupTowerSN < 0) return;
+    const tagBuilding* tower = getBuilding(info, g_backupTowerSN);
+    if(!tower || tower->Percent < 100 || tower->Blood <= 0 || !snFree(tower->SN)) return;
+    const tagArmy* target = nullptr;
+    int bestRank = 999;
+    double bestDistance = 1e30;
+    for(const auto& enemy : info.enemy_armies)
+    {
+        double distance = d2(enemy.DR,enemy.UR,tower->BlockDR*BLOCKSIDELENGTH,
+                             tower->BlockUR*BLOCKSIDELENGTH);
+        if(enemy.Blood <= 0 || distance > TOWER_ATTACK_RANGE_BLOCKS*TOWER_ATTACK_RANGE_BLOCKS*
+                                       BLOCKSIDELENGTH*BLOCKSIDELENGTH) continue;
+        int priority = enemy.WorkObjectSN == g_priestSN ? 0 :
+                       usrGetFarmer(info,enemy.WorkObjectSN) ? 1 :
+                       targetingLiveDefenseTower(info,enemy.WorkObjectSN) ? 4 :
+                       isDangerousRangedEnemy(enemy.Sort) ? 2 : 3;
+        // 同级先分担主塔的其他目标，再保持当前攻击，最后比较距离。
+        // 后两项最多为3，不会覆盖priority；保持目标避免距离变化反复重置射击。
+        int rank = priority*4 + (enemy.SN == g_towerLastAttackTarget ? 2 : 0) +
+                              (enemy.SN == tower->Project ? 0 : 1);
+        if(rank < bestRank || (rank == bestRank && distance < bestDistance))
+        { target = &enemy; bestRank = rank; bestDistance = distance; }
+    }
+    static int lastOrderFrame = -1000;
+    if(!target || tower->Project == target->SN || g_aiframe-lastOrderFrame < 50) return;
+    orderAction(info,tower->SN,target->SN);
+    lastOrderFrame = g_aiframe;
+    dbg(QString("[备用箭塔攻击] tower=%1 target=%2 priority=%3 distance=%4")
+              .arg(tower->SN).arg(target->SN).arg(bestRank/4)
+              .arg(sqrt(bestDistance)/BLOCKSIDELENGTH,0,'f',1));
+}
+
 static int rangedScoutPriority(int sort)
 {
     if(sort == AT_BOWMAN || sort == AT_IMPROVED) return 0;
@@ -2676,18 +3117,25 @@ static int rangedScoutPriority(int sort)
 }
 
 // 第二波后由一名远程兵代替祭司探路。发现敌军、被锁定、低血或接近第三波时
-// 立即返回箭塔；返回后不再外出，直接加入后续防守。
+// 立即返回箭塔；第三波安全结束后允许重新选一名健康远程兵出发一次。
 static void manageRangedScout(const tagInfo& info)
 {
-    if(!g_wave2Handled || g_rangedScoutState == RANGED_SCOUT_LOST) return;
+    if(!g_wave2Handled) return;
+    bool restartAfterWave3 = g_wave3Handled && !g_postWave3ScoutStarted;
+    if(g_rangedScoutState == RANGED_SCOUT_LOST && !restartAfterWave3) return;
 
-    if(g_rangedScoutSN == -1)
+    if(g_rangedScoutSN == -1 || (restartAfterWave3 &&
+       (g_rangedScoutState == RANGED_SCOUT_HOLD || g_rangedScoutState == RANGED_SCOUT_LOST)))
     {
         if(g_defenseMode) return;
         const tagArmy* candidate = nullptr;
         int bestPriority = 99;
         for(const auto& army : info.armies)
         {
+            // 第三波前沿用原选兵规则；后期不派低血或本帧已有命令的兵。
+            if(g_wave3Handled && (army.Blood <= 0 ||
+               army.Blood*100 <= army.MaxBlood*RANGED_SCOUT_RETURN_HEALTH_PERCENT ||
+               !snFree(army.SN))) continue;
             int priority = rangedScoutPriority(army.Sort);
             if(priority < bestPriority ||
                (priority == bestPriority && candidate && army.Blood > candidate->Blood))
@@ -2701,7 +3149,9 @@ static void manageRangedScout(const tagInfo& info)
         g_rangedScoutSN = candidate->SN;
         g_rangedScoutState = RANGED_SCOUT_EXPLORE;
         g_rangedScoutLastMoveFrame = -1000;
-        dbg(QString("[远程探路开始] unit=%1 sort=%2 radius=%3")
+        if(g_wave3Handled) g_postWave3ScoutStarted = true;
+        dbg(QString(g_wave3Handled ? "[后期探路出发] unit=%1 sort=%2 radius=%3" :
+                    "[远程探路开始] unit=%1 sort=%2 radius=%3")
                   .arg(candidate->SN).arg(candidate->Sort)
                   .arg(RANGED_SCOUT_RADIUS_BLOCKS,0,'f',0));
     }
@@ -2709,7 +3159,8 @@ static void manageRangedScout(const tagInfo& info)
     const tagArmy* scout = usrGetArmy(info, g_rangedScoutSN);
     if(!scout)
     {
-        dbg(QString("[远程探路损失] unit=%1 已阵亡，不再派出第二名探路兵")
+        dbg(QString(g_postWave3ScoutStarted ? "[远程探路损失] unit=%1 已阵亡，本轮不再补派" :
+                    "[远程探路损失] unit=%1 已阵亡，第三波结束前不再补派")
                   .arg(g_rangedScoutSN));
         g_rangedScoutSN = -1;
         g_rangedScoutState = RANGED_SCOUT_LOST;
@@ -2740,7 +3191,8 @@ static void manageRangedScout(const tagInfo& info)
         else if(scout->Blood * 100 <= scout->MaxBlood *
                 RANGED_SCOUT_RETURN_HEALTH_PERCENT) reason = QString("low_health");
         else if(nearbyEnemy != -1) reason = QString("enemy_%1").arg(nearbyEnemy);
-        else if(g_aiframe >= FRAME_RANGED_SCOUT_RECALL) reason = QString("wave3_deadline");
+        else if(!g_wave3Handled && g_aiframe >= FRAME_RANGED_SCOUT_RECALL)
+            reason = QString("wave3_deadline");
 
         if(!reason.isEmpty())
         {
@@ -2830,22 +3282,71 @@ static void manageSoldiers(const tagInfo& info)
     double cx = cDR*BLOCKSIDELENGTH, cy = cUR*BLOCKSIDELENGTH;
     static unordered_map<int,int> lastRally;
     static unordered_map<int,int> lastDefenseOrder;
+    static unordered_map<int,int> lastDefenseAttack; // 只记录攻击；归队移动不能推迟重新入选后的拦截。
     static bool siegeTowerLost = false; // 失守时只补记一次当前拦截状态。
     bool clearStragglers = canClearDefenseStragglers(info);
 
     const tagArmy* siege = findTowerSiege(info, g_defTowerDR*BLOCKSIDELENGTH,
-                                        g_defTowerUR*BLOCKSIDELENGTH,
-                                        SIEGE_INTERCEPT_RADIUS_BLOCKS,
-                                        g_siegeInterceptTarget);
+                                         g_defTowerUR*BLOCKSIDELENGTH,
+                                         SIEGE_INTERCEPT_RADIUS_BLOCKS,
+                                         g_siegeInterceptTarget, true);
     const set<int> previousInterceptors = g_siegeInterceptors;
     int previousTarget = g_siegeInterceptTarget;
+    const tagArmy* previousEnemy = nullptr;
+    for(const auto& enemy : info.enemy_armies)
+        if(enemy.SN == previousTarget) { previousEnemy = &enemy; break; }
+    bool waitingForSiege = false;
+    bool missingTarget = g_defenseMode && g_wave2Handled && g_activeDefenseWave >= 3 &&
+                         previousTarget >= 0 && !previousInterceptors.empty() &&
+                         !previousEnemy && !usrGetArmy(info,previousTarget);
+    if(missingTarget)
+    {
+        if(g_siegeMissingSince < 0)
+        {
+            g_siegeMissingSince = g_aiframe;
+            dbg(QString("[拦截目标等待] frame=%1 target=%2 untilFrame=%3")
+                      .arg(g_aiframe).arg(previousTarget)
+                      .arg(g_aiframe+SIEGE_TARGET_MISSING_GRACE_FRAMES));
+        }
+        if(g_aiframe-g_siegeMissingSince < SIEGE_TARGET_MISSING_GRACE_FRAMES)
+        {
+            waitingForSiege = true;
+            siege = nullptr; // 保留旧任务；不能对不可见目标或临时替代目标反复下令。
+        }
+        else
+        {
+            dbg(QString("[拦截目标等待超时] frame=%1 target=%2 waited=%3")
+                      .arg(g_aiframe).arg(previousTarget).arg(g_aiframe-g_siegeMissingSince));
+            g_siegeMissingSince = -1;
+        }
+    }
+    else if(g_siegeMissingSince >= 0)
+    {
+        QString reason = previousEnemy ? (previousEnemy->Blood > 0 ? QString("visible") : QString("dead")) :
+                         usrGetArmy(info,previousTarget) ? QString("converted") : QString("cancelled");
+        dbg(QString("[拦截目标等待结束] frame=%1 target=%2 waited=%3 reason=%4")
+                  .arg(g_aiframe).arg(previousTarget).arg(g_aiframe-g_siegeMissingSince).arg(reason));
+        g_siegeMissingSince = -1;
+    }
+    bool thirdWaveDefense = g_defenseMode && g_wave2Handled && g_activeDefenseWave >= 3;
+    bool startedHandoff = false;
+    if(g_siegeHandoffSince < 0 && thirdWaveDefense && !siege &&
+       previousEnemy && previousEnemy->Blood <= 0 && !usrGetArmy(info,previousTarget) &&
+       !previousInterceptors.empty())
+    {
+        g_siegeHandoffSince = g_aiframe;
+        g_siegeHandoffPrevious = previousTarget;
+        startedHandoff = true;
+    }
+    bool waitingForHandoff = g_siegeHandoffSince >= 0 && thirdWaveDefense && !siege &&
+                             g_aiframe-g_siegeHandoffSince < SIEGE_HANDOFF_WAIT_FRAMES;
+    bool holdingInterceptors = waitingForSiege || waitingForHandoff;
     g_siegeInterceptors.clear();
-    g_siegeInterceptTarget = siege ? siege->SN : -1;
-    if(siege)
+    g_siegeInterceptTarget = waitingForSiege ? previousTarget : siege ? siege->SN : -1;
+    if(siege || holdingInterceptors)
     {
         vector<const tagArmy*> candidates;
         int defenders = 0;
-        const double radius = SIEGE_INTERCEPT_RADIUS_BLOCKS*BLOCKSIDELENGTH;
         auto meleePriority = [](int sort) {
             if(sort == AT_CAVALRY || sort == AT_CHARIOT) return 0;
             if(sort == AT_SCOUT) return 1;
@@ -2855,6 +3356,10 @@ static void manageSoldiers(const tagInfo& info)
         };
         for(const auto& army : info.armies)
         {
+            // 原拦截兵不因追击时刚跨过14格而被撤回；新人仍只从14格内选。
+            double radius = (previousInterceptors.count(army.SN) ?
+                             DEFENSE_SAFE_CORE_BLOCKS : SIEGE_INTERCEPT_RADIUS_BLOCKS)
+                            * BLOCKSIDELENGTH;
             if(army.Sort == AT_PRIEST || army.Sort == AT_SHIP || army.Blood <= 0 ||
                army.Blood*100 < army.MaxBlood*SIEGE_INTERCEPT_MIN_HEALTH_PERCENT ||
                d2(army.DR, army.UR, g_defTowerDR*BLOCKSIDELENGTH,
@@ -2863,7 +3368,8 @@ static void manageSoldiers(const tagInfo& info)
                 (g_rangedScoutState == RANGED_SCOUT_EXPLORE ||
                  g_rangedScoutState == RANGED_SCOUT_RETURN))) continue;
             ++defenders;
-            if(meleePriority(army.Sort) >= 0) candidates.push_back(&army);
+            if(meleePriority(army.Sort) >= 0 &&
+               (!holdingInterceptors || previousInterceptors.count(army.SN))) candidates.push_back(&army);
         }
         // 保持现有拦截成员，避免每帧因距离变化换人；新增成员优先选快速近战兵。
         sort(candidates.begin(), candidates.end(), [&](const tagArmy* a, const tagArmy* b) {
@@ -2871,6 +3377,7 @@ static void manageSoldiers(const tagInfo& info)
                 return previousInterceptors.count(a->SN) > previousInterceptors.count(b->SN);
             if(meleePriority(a->Sort) != meleePriority(b->Sort))
                 return meleePriority(a->Sort) < meleePriority(b->Sort);
+            if(holdingInterceptors) return a->SN < b->SN;
             double da = d2(a->DR, a->UR, siege->DR, siege->UR);
             double db = d2(b->DR, b->UR, siege->DR, siege->UR);
             return da == db ? a->SN < b->SN : da < db;
@@ -2879,8 +3386,37 @@ static void manageSoldiers(const tagInfo& info)
         for(const auto* army : candidates)
             if((int)g_siegeInterceptors.size() < count) g_siegeInterceptors.insert(army->SN);
     }
+    if(g_siegeHandoffSince >= 0)
+    {
+        int waited = g_aiframe-g_siegeHandoffSince;
+        if(!waitingForHandoff || g_siegeInterceptors.empty())
+        {
+            if(thirdWaveDefense && siege && !g_siegeInterceptors.empty())
+                dbg(QString("[拦截交接接上] frame=%1 previous=%2 target=%3 waited=%4")
+                          .arg(g_aiframe).arg(g_siegeHandoffPrevious).arg(siege->SN).arg(waited));
+            else
+                dbg(QString("[拦截交接结束] frame=%1 previous=%2 waited=%3 reason=%4")
+                          .arg(g_aiframe).arg(g_siegeHandoffPrevious).arg(waited)
+                          .arg(!thirdWaveDefense ? QString("defense_finished") :
+                               !siege && waited >= SIEGE_HANDOFF_WAIT_FRAMES ? QString("timeout") :
+                               QString("no_members")));
+            g_siegeHandoffSince = g_siegeHandoffPrevious = -1;
+            waitingForHandoff = false;
+            holdingInterceptors = waitingForSiege;
+        }
+        else if(startedHandoff)
+        {
+            QString members;
+            for(int sn : g_siegeInterceptors) members += QString(" %1").arg(sn);
+            dbg(QString("[拦截交接待命] frame=%1 previous=%2 units=%3 untilFrame=%4")
+                      .arg(g_aiframe).arg(g_siegeHandoffPrevious).arg(members)
+                      .arg(g_siegeHandoffSince+SIEGE_HANDOFF_WAIT_FRAMES));
+        }
+    }
     const tagBuilding* tower = getBuilding(info, g_defTowerSN);
-    bool towerLost = siege && (!tower || tower->Blood <= 0);
+    bool towerLost = (siege || holdingInterceptors) && (!tower || tower->Blood <= 0);
+    bool steadyGuardTargets = g_defenseMode && g_wave2Handled && g_activeDefenseWave >= 3 &&
+                              (!tower || tower->Blood <= 0);
     if(previousTarget != g_siegeInterceptTarget || previousInterceptors != g_siegeInterceptors ||
        towerLost != siegeTowerLost)
     {
@@ -2889,10 +3425,20 @@ static void manageSoldiers(const tagInfo& info)
         const tagArmy* oldEnemy = nullptr;
         for(const auto& enemy : info.enemy_armies)
             if(enemy.SN == previousTarget) { oldEnemy = &enemy; break; }
-        dbg(QString("[第三波投石车拦截] target=%1 units=%2 previous=%3 towerHP=%4 previousEnemyTarget=%5")
+        QString reason = QString("members_or_tower_changed");
+        if(previousTarget != g_siegeInterceptTarget)
+            reason = usrGetArmy(info, previousTarget) ? QString("converted") :
+                     !oldEnemy ? QString("target_removed") :
+                     oldEnemy->Blood <= 0 ? QString("target_dead") :
+                     QString("out_of_defense_area");
+        if(previousTarget < 0) reason = QString("acquired");
+        dbg(QString("[第三波投石车拦截] target=%1 units=%2 previous=%3 towerHP=%4 previousEnemyTarget=%5 reason=%6 previousDistance=%7")
                   .arg(g_siegeInterceptTarget).arg(members.isEmpty() ? QString("none") : members)
                   .arg(previousTarget).arg(tower ? tower->Blood : 0)
-                  .arg(oldEnemy ? oldEnemy->WorkObjectSN : -1));
+                  .arg(oldEnemy ? oldEnemy->WorkObjectSN : -1).arg(reason)
+                  .arg(oldEnemy ? sqrt(d2(oldEnemy->DR, oldEnemy->UR,
+                           g_defTowerDR*BLOCKSIDELENGTH, g_defTowerUR*BLOCKSIDELENGTH))
+                           /BLOCKSIDELENGTH : -1.0, 0, 'f', 1));
     }
     siegeTowerLost = towerLost;
     set<int> cleanupUnits;
@@ -2912,6 +3458,20 @@ static void manageSoldiers(const tagInfo& info)
     for(int sn : previousInterceptors)
     {
         const tagArmy* army = usrGetArmy(info, sn);
+        if(!g_siegeInterceptors.count(sn))
+        {
+            const double radius = DEFENSE_SAFE_CORE_BLOCKS*BLOCKSIDELENGTH;
+            QString reason = !army ? QString("unit_missing") :
+                (!siege && !holdingInterceptors) ? QString("task_end") :
+                army->Blood <= 0 ? QString("dead") :
+                army->Blood*100 < army->MaxBlood*SIEGE_INTERCEPT_MIN_HEALTH_PERCENT ? QString("low_health") :
+                d2(army->DR, army->UR, g_defTowerDR*BLOCKSIDELENGTH,
+                   g_defTowerUR*BLOCKSIDELENGTH) > radius*radius
+                    ? QString("outside_radius") : QString("guard_or_quota");
+            dbg(QString("[拦截退出原因] frame=%1 unit=%2 blood=%3/%4 reason=%5")
+                      .arg(g_aiframe).arg(sn).arg(army ? army->Blood : -1)
+                      .arg(army ? army->MaxBlood : -1).arg(reason));
+        }
         if(army && army->Blood > 0 && !g_siegeInterceptors.count(sn) &&
            snFree(sn))
         {
@@ -2931,14 +3491,16 @@ static void manageSoldiers(const tagInfo& info)
 
         if(g_defenseMode)
         {
-            if(siege && g_siegeInterceptors.count(a.SN))
+            if((siege || holdingInterceptors) && g_siegeInterceptors.count(a.SN))
             {
-                int last = lastDefenseOrder.count(a.SN) ? lastDefenseOrder[a.SN] : -99999;
+                if(holdingInterceptors) continue; // 缺失等待或交接待命时不移动、不补发攻击。
+                int last = lastDefenseAttack.count(a.SN) ? lastDefenseAttack[a.SN] : -99999;
                 if(a.WorkObjectSN != siege->SN && g_aiframe-last >= 50 && snFree(a.SN))
                 {
                     // 拦截兵允许打断普通攻击；其他士兵继续走原有的祭司护卫逻辑。
                     orderAction(info, a.SN, siege->SN);
                     lastDefenseOrder[a.SN] = g_aiframe;
+                    lastDefenseAttack[a.SN] = g_aiframe;
                     dbg(QString("[投石车拦截下单] unit=%1 target=%2").arg(a.SN).arg(siege->SN));
                 }
                 continue;
@@ -2962,11 +3524,17 @@ static void manageSoldiers(const tagInfo& info)
                 else if(dc > r14) continue;
 
                 int priority = 3;
-                if(e.WorkObjectSN == g_priestSN) priority = 0;
+                if(e.WorkObjectSN == g_priestSN)
+                    priority = steadyGuardTargets && isDangerousRangedEnemy(e.Sort) ? -1 : 0;
                 else if(isDangerousRangedEnemy(e.Sort)) priority = 1;
                 else if(usrGetFarmer(info, e.WorkObjectSN)) priority = 2;
+                // 第三波塔毁后，同级保留当前有效目标；出现更高优先级追兵才转火。
+                // 塔仍在或前两波时，继续按原来的优先级和阵地距离选择。
+                bool current = steadyGuardTargets && e.SN == a.WorkObjectSN;
+                bool selectedCurrent = steadyGuardTargets && target == a.WorkObjectSN;
                 if(priority < bestPriority ||
-                   (priority == bestPriority && dc < best))
+                   (priority == bestPriority && ((current && !selectedCurrent) ||
+                    (current == selectedCurrent && dc < best))))
                 {
                     bestPriority = priority;
                     best = dc;
@@ -2975,7 +3543,7 @@ static void manageSoldiers(const tagInfo& info)
             }
 
             // 正在攻击时通常不打断；如果出现新的祭司追兵，则立即转火救援。
-            bool urgentPriestRescue = bestPriority == 0;
+            bool urgentPriestRescue = bestPriority <= 0;
             int last = lastDefenseOrder.count(a.SN) ? lastDefenseOrder[a.SN] : -99999;
             if(target != -1 && a.WorkObjectSN != target &&
                (a.NowState != HUMAN_STATE_ATTACKING || urgentPriestRescue) &&
@@ -2983,9 +3551,15 @@ static void manageSoldiers(const tagInfo& info)
             {
                 orderAction(info, a.SN, target);
                 lastDefenseOrder[a.SN] = g_aiframe;
+                lastDefenseAttack[a.SN] = g_aiframe;
                 if(urgentPriestRescue)
+                {
                     dbg(QString("[转化兵护卫] unit=%1 target=%2 保护祭司")
                               .arg(a.SN).arg(target));
+                    if(steadyGuardTargets)
+                        dbg(QString("[塔毁后护卫转火] unit=%1 previous=%2 target=%3 priority=%4")
+                                  .arg(a.SN).arg(a.WorkObjectSN).arg(target).arg(bestPriority));
+                }
                 else if(cleanupUnits.count(a.SN))
                     dbg(QString("[第三波清场] unit=%1 target=%2 distance=%3")
                               .arg(a.SN).arg(target).arg(sqrt(best)/BLOCKSIDELENGTH,0,'f',1));
@@ -3028,7 +3602,7 @@ static void idleResume(const tagInfo& info)
             if(g_berryFarmWorkers.count(sn))
             {
                 t = chooseBerryWorkerFoodTarget(info, *f);
-                if(isCompletedFarm(info, t))
+                if(usableFarmTarget(info, t))
                 {
                     kv.second = ROLE_FARM;
                     dbg(QString("[浆果转农田] farmer=%1 farm=%2").arg(sn).arg(t));
@@ -3068,6 +3642,7 @@ void UsrAI::processData()
     g_aiframe = info.GameFrame;
     g_orderedThisFrame.clear();
     processBuildResults(info);
+    processScoreStockProgress(info);
     processFarmResumeResult(info);
     processGatherResults(info);
     cleanupGatherTargets(info);
@@ -3109,6 +3684,9 @@ void UsrAI::processData()
     // 4) 新村民分配（每帧最多1个）；防守期也正常分工，避免在TC旁闲置
     if(g_initDone) assignNewFarmer(info);
 
+    // 第二波后仅为新增一座箭塔临时采石；达到预算或完工后恢复伐木。
+    if(g_initDone) manageTowerStoneWorkers(info);
+
     // 升铜前临时提高食物工比例，铜器完成后恢复原有经济结构。
     if(g_initDone && !g_defenseMode) manageUpgradeFoodWorkers(info);
 
@@ -3129,6 +3707,7 @@ void UsrAI::processData()
 
     // 箭塔先逐个拉走祭司追兵，再固定高威胁目标供祭司转换。
     manageDefenseTower(info);
+    manageBackupTower(info);
 
     // 7) 祭司（探路/回防/转换）
     managePriest(info);
